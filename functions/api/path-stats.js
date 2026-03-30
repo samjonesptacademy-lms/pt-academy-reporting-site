@@ -74,8 +74,10 @@ export async function onRequestGet({ request, env }) {
     // 4. Response is an array of path stats records
     const allRecords = Array.isArray(body) ? body : body.data ?? [];
 
-    // 5. Filter for learners with completedAt (indicates path completion)
-    const completedRecords = allRecords.filter((record) => record.completedAt);
+    // 5. Filter for learners with successful status
+    const completedRecords = allRecords.filter(
+      (record) => record.status && record.status.type === "successful"
+    );
 
     // 6. Fetch user details for each completed learner to get names
     const completedLearners = await Promise.all(
