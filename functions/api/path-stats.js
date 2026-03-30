@@ -71,6 +71,9 @@ export async function onRequestGet({ request, env }) {
 
     const body = await statsRes.json();
 
+    // DEBUG: Log raw response to see structure
+    console.log("Raw API response:", JSON.stringify(body).substring(0, 500));
+
     // 4. Normalise response data
     // Handle both array and paginated object responses
     const allRecords = Array.isArray(body) ? body : body.data ?? [];
