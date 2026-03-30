@@ -44,16 +44,15 @@ export async function onRequestGet({ request, env }) {
     const accessToken = tokenBody.access_token;
 
     // 3. Fetch path stats filtered by pathId
-    const statsRes = await fetch(
-      `https://app.360learning.com/api/v2/paths/stats?pathId=${encodeURIComponent(pathId)}`,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "360-api-version": "v2.0",
-          "accept": "application/json",
-        },
-      }
-    );
+    // API requires pathId[in][0] format; brackets must not be encoded
+    const url = `https://app.360learning.com/api/v2/paths/stats?pathId[in][0]=${pathId}`;
+    const statsRes = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "360-api-version": "v2.0",
+        "accept": "application/json",
+      },
+    });
 
     if (!statsRes.ok) {
       console.error(
