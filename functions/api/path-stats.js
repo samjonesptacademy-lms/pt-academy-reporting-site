@@ -71,44 +71,59 @@ export async function onRequestGet({ request, env }) {
 
     const body = await statsRes.json();
 
-    // DEBUG: Log raw response to see structure
-    console.log("Raw API response:", JSON.stringify(body).substring(0, 500));
-
-    // 4. Normalise response data
-    // Handle both array and paginated object responses
+    // 4. Response is an array of path stats records
     const allRecords = Array.isArray(body) ? body : body.data ?? [];
 
-    // 5. Filter for completed learners and normalise fields
-    const completedLearners = allRecords
-      .filter((record) => record.status === "completed")
-      .map((record) => {
-        // Normalise name field (multiple possible variations)
-        let name;
-        if (record.firstName && record.lastName) {
-          name = `${record.firstName} ${record.lastName}`;
-        } else if (record.name) {
-          name = record.name;
-        } else if (record.fullName) {
-          name = record.fullName;
-        } else if (record.email || record.mail) {
-          name = record.email || record.mail;
-        } else {
-          name = "Unknown";
+    // 5. Filter for learners with completedAt (indicates path completion)
+    const completedRecords = allRecords.filter((record) => record.completedAt);
+
+    // 6. Fetch user details for each completed learner to get names
+    const completedLearners = await Promise.all(
+      completedRecords.map(async (record) => {
+        try {
+          // Fetch user details to get firstName/lastName
+          const userRes = await fetch(
+            `https://app.360learning.com/api/v2/users/${record.userId}`,
+            {
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                "360-api-version": "v2.0",
+                "accept": "application/json",
+              },
+            }
+          );
+
+          let name = "Unknown";
+          let email = "";
+
+          if (userRes.ok) {
+            const userData = await userRes.json();
+            if (userData.firstName && userData.lastName) {
+              name = `${userData.firstName} ${userData.lastName}`;
+            }
+            email = userData.mail || userData.email || "";
+          }
+
+          return {
+            name,
+            email,
+            completedAt: record.completedAt,
+            score: record.score ?? null,
+          };
+        } catch (error) {
+          console.error(`Failed to fetch user ${record.userId}:`, error.message);
+          return {
+            name: "Unknown",
+            email: "",
+            completedAt: record.completedAt,
+            score: record.score ?? null,
+          };
         }
-
-        // Normalise email field
-        const email = record.email || record.mail || "";
-
-        // Normalise completion date field
-        const completedAt = record.completedAt || record.completionDate || null;
-
-        // Include score if present
-        const score = record.score ?? null;
-
-        return { name, email, completedAt, score };
       })
-      // Sort alphabetically by name
-      .sort((a, b) => a.name.localeCompare(b.name));
+    );
+
+    // 7. Sort alphabetically by name
+    completedLearners.sort((a, b) => a.name.localeCompare(b.name));
 
     // 6. Check if any learner has a score (to determine if we should show score column)
     const hasScores = completedLearners.some((l) => l.score !== null);
