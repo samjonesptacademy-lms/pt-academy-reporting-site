@@ -111,6 +111,7 @@ export async function onRequestGet({ request, env }) {
             email,
             completedAt: record.completedAt,
             score: record.score ?? null,
+            sessionId: record.sessionId,
           };
         } catch (error) {
           console.error(`Failed to fetch user ${record.userId}:`, error.message);
