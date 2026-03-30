@@ -5,9 +5,15 @@
  */
 
 export async function onRequestGet({ request, env }) {
-  // 1. Read query parameter
+  // 1. Read query parameters
   const url = new URL(request.url);
   const pathId = url.searchParams.get("pathId");
+  const sessionIdsParam = url.searchParams.get("sessionIds");
+
+  // Parse sessionIds (comma-separated or pipe-separated)
+  const allowedSessionIds = sessionIdsParam
+    ? sessionIdsParam.split(/[,|]/).map((id) => id.trim())
+    : null;
 
   if (!pathId) {
     return Response.json({ error: "pathId is required" }, { status: 400 });
@@ -74,10 +80,15 @@ export async function onRequestGet({ request, env }) {
     // 4. Response is an array of path stats records
     const allRecords = Array.isArray(body) ? body : body.data ?? [];
 
-    // 5. Filter for learners with successful status
-    const completedRecords = allRecords.filter(
-      (record) => record.status && record.status.type === "successful"
-    );
+    // 5. Filter for learners with successful status (and optional sessionIds)
+    const completedRecords = allRecords.filter((record) => {
+      const hasSuccessfulStatus =
+        record.status && record.status.type === "successful";
+      const hasCorrectSession = !allowedSessionIds
+        ? true
+        : allowedSessionIds.includes(record.sessionId);
+      return hasSuccessfulStatus && hasCorrectSession;
+    });
 
     // 6. Fetch user details for each completed learner to get names
     const completedLearners = await Promise.all(

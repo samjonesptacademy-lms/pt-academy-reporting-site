@@ -328,8 +328,13 @@
   <script>
     // Configuration
     const PATHS = {
-      "Level 2": "68c3d8c1ab3b1275d77f98a9",
-      "Level 3": "683870d4260fd5d3514fd2dc",
+      "Level 2": {
+        pathId: "68c3d8c1ab3b1275d77f98a9",
+      },
+      "Level 3": {
+        pathId: "683870d4260fd5d3514fd2dc",
+        sessionIds: ["696a5771e3a6f9fd3454b982", "697883bafbd854fd425f31b3"],
+      },
     };
 
     // State
@@ -377,8 +382,12 @@
           '<div class="message loading"><span class="spinner"></span>Loading...</div>';
         contentArea.innerHTML = "";
 
-        const pathId = PATHS[currentLevel];
-        const response = await fetch(`/api/path-stats?pathId=${pathId}`);
+        const pathConfig = PATHS[currentLevel];
+        let url = `/api/path-stats?pathId=${pathConfig.pathId}`;
+        if (pathConfig.sessionIds) {
+          url += `&sessionIds=${pathConfig.sessionIds.join(",")}`;
+        }
+        const response = await fetch(url);
 
         if (!response.ok) {
           const error = await response.json();
