@@ -113,8 +113,20 @@ export async function onRequestGet({ request, env }) {
             const userData = await userRes.json();
             if (userData.firstName && userData.lastName) {
               name = `${userData.firstName} ${userData.lastName}`;
+            } else {
+              console.warn(
+                `User ${record.userId} fetch ok but missing name fields. Keys: ${Object.keys(
+                  userData
+                ).join(",")} | firstName=${JSON.stringify(
+                  userData.firstName
+                )} lastName=${JSON.stringify(userData.lastName)}`
+              );
             }
             email = userData.mail || userData.email || "";
+          } else {
+            console.warn(
+              `User ${record.userId} fetch failed: status=${userRes.status} ${userRes.statusText}`
+            );
           }
 
           return {
@@ -131,10 +143,18 @@ export async function onRequestGet({ request, env }) {
             email: "",
             completedAt: record.completedAt,
             score: record.score ?? null,
+            sessionId: record.sessionId,
           };
         }
       })
     );
+
+    const unknownCount = completedLearners.filter((l) => l.name === "Unknown").length;
+    if (unknownCount > 0) {
+      console.warn(
+        `path-stats: ${unknownCount}/${completedLearners.length} learners came back as Unknown for pathId=${pathId}`
+      );
+    }
 
     // 7. Sort alphabetically by name
     completedLearners.sort((a, b) => a.name.localeCompare(b.name));
