@@ -90,64 +90,56 @@ export async function onRequestGet({ request, env }) {
       return hasSuccessfulStatus && hasCorrectSession;
     });
 
-    // 6. Fetch user details for each completed learner to get names
-    const completedLearners = await Promise.all(
-      completedRecords.map(async (record) => {
-        try {
-          // Fetch user details to get firstName/lastName
-          const userRes = await fetch(
-            `https://app.360learning.com/api/v2/users/${record.userId}`,
-            {
-              headers: {
-                Authorization: `Bearer ${accessToken}`,
-                "360-api-version": "v2.0",
-                "accept": "application/json",
-              },
-            }
-          );
+    // 6. Bulk-fetch user details in one call (avoids Cloudflare's 50
+    //    subrequest-per-invocation cap that 1-call-per-user would hit).
+    const usersById = new Map();
+    if (completedRecords.length > 0) {
+      const idParams = completedRecords
+        .map((r, i) => `_id[in][${i}]=${encodeURIComponent(r.userId)}`)
+        .join("&");
+      const usersUrl = `https://app.360learning.com/api/v2/users?${idParams}`;
+      const usersRes = await fetch(usersUrl, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "360-api-version": "v2.0",
+          "accept": "application/json",
+        },
+      });
 
-          let name = "Unknown";
-          let email = "";
-
-          if (userRes.ok) {
-            const userData = await userRes.json();
-            if (userData.firstName && userData.lastName) {
-              name = `${userData.firstName} ${userData.lastName}`;
-            } else {
-              console.warn(
-                `User ${record.userId} fetch ok but missing name fields. Keys: ${Object.keys(
-                  userData
-                ).join(",")} | firstName=${JSON.stringify(
-                  userData.firstName
-                )} lastName=${JSON.stringify(userData.lastName)}`
-              );
-            }
-            email = userData.mail || userData.email || "";
-          } else {
-            console.warn(
-              `User ${record.userId} fetch failed: status=${userRes.status} ${userRes.statusText}`
-            );
-          }
-
-          return {
-            name,
-            email,
-            completedAt: record.completedAt,
-            score: record.score ?? null,
-            sessionId: record.sessionId,
-          };
-        } catch (error) {
-          console.error(`Failed to fetch user ${record.userId}:`, error.message);
-          return {
-            name: "Unknown",
-            email: "",
-            completedAt: record.completedAt,
-            score: record.score ?? null,
-            sessionId: record.sessionId,
-          };
+      if (!usersRes.ok) {
+        console.warn(
+          `Bulk users fetch failed: status=${usersRes.status} ${usersRes.statusText}`
+        );
+      } else {
+        const usersBody = await usersRes.json();
+        const usersList = Array.isArray(usersBody) ? usersBody : usersBody.data ?? [];
+        for (const u of usersList) {
+          const id = u._id || u.id;
+          if (id) usersById.set(id, u);
         }
-      })
-    );
+      }
+    }
+
+    const completedLearners = completedRecords.map((record) => {
+      const user = usersById.get(record.userId);
+      let name = "Unknown";
+      let email = "";
+      if (user) {
+        if (user.firstName && user.lastName) {
+          name = `${user.firstName} ${user.lastName}`;
+        }
+        email = user.mail || user.email || "";
+      } else {
+        console.warn(`User ${record.userId} missing from bulk users response`);
+      }
+      return {
+        name,
+        email,
+        completedAt: record.completedAt,
+        score: record.score ?? null,
+        sessionId: record.sessionId,
+      };
+    });
 
     const unknownCount = completedLearners.filter((l) => l.name === "Unknown").length;
     if (unknownCount > 0) {
