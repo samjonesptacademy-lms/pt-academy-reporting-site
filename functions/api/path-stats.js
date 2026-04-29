@@ -90,33 +90,40 @@ export async function onRequestGet({ request, env }) {
       return hasSuccessfulStatus && hasCorrectSession;
     });
 
-    // 6. Bulk-fetch user details in one call (avoids Cloudflare's 50
-    //    subrequest-per-invocation cap that 1-call-per-user would hit).
+    // 6. Fetch user cache from Google Apps Script (All Users Cache sheet).
+    //    One subrequest replaces N per-user 360Learning calls and stays well
+    //    under Cloudflare's 50-subrequest-per-invocation cap.
     const usersById = new Map();
     if (completedRecords.length > 0) {
-      const idParams = completedRecords
-        .map((r, i) => `_id[in][${i}]=${encodeURIComponent(r.userId)}`)
-        .join("&");
-      const usersUrl = `https://app.360learning.com/api/v2/users?${idParams}`;
-      const usersRes = await fetch(usersUrl, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "360-api-version": "v2.0",
-          "accept": "application/json",
-        },
-      });
-
-      if (!usersRes.ok) {
-        console.warn(
-          `Bulk users fetch failed: status=${usersRes.status} ${usersRes.statusText}`
+      try {
+        const cacheRes = await fetch(
+          "https://script.google.com/macros/s/AKfycbyXDLwx_32YNHnDpoVUX4KOYhAUs8805GRokb8REjriyvo7VfpCLtL8XgmX17rlefth/exec",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "getLearnerCache" }),
+            redirect: "follow",
+          }
         );
-      } else {
-        const usersBody = await usersRes.json();
-        const usersList = Array.isArray(usersBody) ? usersBody : usersBody.data ?? [];
-        for (const u of usersList) {
-          const id = u._id || u.id;
-          if (id) usersById.set(id, u);
+
+        if (!cacheRes.ok) {
+          console.warn(
+            `Apps Script cache fetch failed: status=${cacheRes.status} ${cacheRes.statusText}`
+          );
+        } else {
+          const cacheBody = await cacheRes.json();
+          if (cacheBody.success && cacheBody.cache) {
+            for (const [id, info] of Object.entries(cacheBody.cache)) {
+              usersById.set(id, info);
+            }
+          } else {
+            console.warn(
+              `Apps Script cache returned no data: ${cacheBody.error || "unknown"}`
+            );
+          }
         }
+      } catch (error) {
+        console.error("Apps Script cache fetch threw:", error.message);
       }
     }
 
@@ -128,9 +135,9 @@ export async function onRequestGet({ request, env }) {
         if (user.firstName && user.lastName) {
           name = `${user.firstName} ${user.lastName}`;
         }
-        email = user.mail || user.email || "";
+        email = user.email || user.mail || "";
       } else {
-        console.warn(`User ${record.userId} missing from bulk users response`);
+        console.warn(`User ${record.userId} missing from Apps Script cache`);
       }
       return {
         name,
