@@ -1,8 +1,15 @@
 /**
  * Cloudflare Pages Function
- * Lists Self Study / Mentor Led learners who have made no progress in the
- * in-scope paths (and sub paths), for migration to the new LXP.
- * Endpoint: GET /api/no-progress?key=XXX
+ * Data feed for the "no progress" report: Self Study / Mentor Led learners and
+ * their activity in the in-scope paths (and sub paths), for migration to the new LXP.
+ *
+ * GET /api/no-progress?key=XXX&mode=learners
+ *     -> learners in the two groups, with names/emails
+ * GET /api/no-progress?key=XXX&mode=stats[&cursor=URL]
+ *     -> path stats reduced per user for up to MAX_PAGES pages, plus `next`
+ *        (the cursor for the following call, null when finished). The full
+ *        result is too big for one invocation (Cloudflare's 50-subrequest cap),
+ *        so the caller loops and merges.
  *
  * Returns learner names and emails, so it is gated by a key (only its SHA-256
  * hash lives in this file).
@@ -155,37 +162,128 @@ async function sha256Hex(text) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Follows the Link: <url>; rel="next" header until there are no more pages.
-// `budget` is shared so the whole invocation stays under Cloudflare's subrequest cap.
-async function fetchAll(startUrl, accessToken, budget) {
-  const items = [];
-  let next = startUrl;
-  while (next) {
-    if (budget.left <= 0) throw new Error("Subrequest budget exhausted while paginating");
-    budget.left--;
-    const res = await fetch(next, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "360-api-version": "v2.0",
-        accept: "application/json",
-      },
-    });
-    if (!res.ok) {
-      throw new Error(`${res.status} ${res.statusText} for ${next.split("?")[0]}: ${await res.text()}`);
-    }
-    const body = await res.json();
-    items.push(...(Array.isArray(body) ? body : body.data ?? []));
-    const match = (res.headers.get("Link") || "").match(/<([^>]+)>;\s*rel="next"/);
-    next = match ? new URL(match[1], BASE).href : null;
-    budget.pages++;
+const MAX_PAGES = 40;
+
+const FETCH_HEADERS = (accessToken) => ({
+  Authorization: `Bearer ${accessToken}`,
+  "360-api-version": "v2.0",
+  accept: "application/json",
+});
+
+// Returns the page's items and the next-page URL (null when there is none)
+async function fetchPage(url, accessToken) {
+  const res = await fetch(url, { headers: FETCH_HEADERS(accessToken) });
+  if (!res.ok) {
+    throw new Error(`${res.status} ${res.statusText} for ${url.split("?")[0]}: ${await res.text()}`);
   }
-  return items;
+  const body = await res.json();
+  const match = (res.headers.get("Link") || "").match(/<([^>]+)>;\s*rel="next"/);
+  return {
+    items: Array.isArray(body) ? body : body.data ?? [],
+    next: match ? new URL(match[1], BASE).href : null,
+  };
+}
+
+async function getLearners(accessToken) {
+  const learners = new Map(); // userId -> Set of group names
+  for (const [groupId, groupName] of Object.entries(GROUP_IDS)) {
+    let next = `${BASE}/api/v2/groups/${groupId}/roles`;
+    while (next) {
+      const page = await fetchPage(next, accessToken);
+      for (const m of page.items) {
+        if (m.role !== "learner") continue;
+        if (!learners.has(m.userId)) learners.set(m.userId, new Set());
+        learners.get(m.userId).add(groupName);
+      }
+      next = page.next;
+    }
+  }
+
+  const usersById = new Map();
+  try {
+    const cacheRes = await fetch(CACHE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "getLearnerCache" }),
+      redirect: "follow",
+    });
+    const cacheBody = cacheRes.ok ? await cacheRes.json() : {};
+    if (cacheBody.success && cacheBody.cache) {
+      for (const [id, info] of Object.entries(cacheBody.cache)) usersById.set(id, info);
+    } else {
+      console.warn("Apps Script cache returned no data:", cacheBody.error || cacheRes.status);
+    }
+  } catch (error) {
+    console.error("Apps Script cache fetch threw:", error.message);
+  }
+
+  return [...learners].map(([userId, groups]) => {
+    const user = usersById.get(userId);
+    return {
+      userId,
+      name: user && user.firstName && user.lastName ? `${user.firstName} ${user.lastName}` : "Unknown",
+      email: user ? user.email || user.mail || "" : "",
+      groups: [...groups].sort(),
+    };
+  });
+}
+
+async function getStats(accessToken, cursor) {
+  // Brackets must not be encoded
+  const first = `${BASE}/api/v2/paths/stats?${PATH_IDS.map((id, i) => `pathId[in][${i}]=${id}`).join("&")}`;
+  let next = cursor || first;
+  // The bearer token is only ever sent to the stats endpoint
+  if (!next.startsWith(`${BASE}/api/v2/paths/stats`)) throw new Error("Invalid cursor");
+
+  const byUser = new Map();
+  const statusCounts = {};
+  let records = 0;
+  let pages = 0;
+  while (next && pages < MAX_PAGES) {
+    const page = await fetchPage(next, accessToken);
+    pages++;
+    records += page.items.length;
+    for (const s of page.items) {
+      const type = s.status?.type ?? "none";
+      statusCounts[type] = (statusCounts[type] || 0) + 1;
+      let u = byUser.get(s.userId);
+      if (!u) {
+        u = { u: s.userId, active: false, enrolments: 0, pathIds: new Set(), enrolledAt: null };
+        byUser.set(s.userId, u);
+      }
+      // Any activity counts, including on unenrolled records, so lost progress is never hidden
+      if ((s.progress ?? 0) > 0 || (s.timeSpent ?? 0) > 0 || s.startedAt) u.active = true;
+      if (!s.unenrolledAt) u.enrolments++;
+      u.pathIds.add(s.pathId);
+      if (s.enrolledAt && (!u.enrolledAt || s.enrolledAt < u.enrolledAt)) u.enrolledAt = s.enrolledAt;
+    }
+    next = page.next;
+  }
+
+  return {
+    records,
+    pages,
+    statusCounts,
+    next,
+    users: [...byUser.values()].map((u) => ({
+      u: u.u,
+      active: u.active,
+      enrolments: u.enrolments,
+      enrolledAt: u.enrolledAt,
+      // Path lists are only needed to report on users with no activity
+      pathIds: u.active ? undefined : [...u.pathIds],
+    })),
+  };
 }
 
 export async function onRequestGet({ request, env }) {
-  const key = new URL(request.url).searchParams.get("key") || "";
-  if ((await sha256Hex(key)) !== KEY_SHA256) {
+  const params = new URL(request.url).searchParams;
+  if ((await sha256Hex(params.get("key") || "")) !== KEY_SHA256) {
     return Response.json({ error: "Forbidden" }, { status: 403 });
+  }
+  const mode = params.get("mode");
+  if (mode !== "learners" && mode !== "stats") {
+    return Response.json({ error: "mode must be learners or stats" }, { status: 400 });
   }
 
   try {
@@ -204,109 +302,11 @@ export async function onRequestGet({ request, env }) {
     }
     const { access_token: accessToken } = await tokenRes.json();
 
-    // 1 token + 1 cache already used; leave the rest for pagination
-    const budget = { left: 46, pages: 0 };
-
-    // 1. Learners in the two groups (role === "learner")
-    const learners = new Map(); // userId -> Set of group names
-    for (const [groupId, groupName] of Object.entries(GROUP_IDS)) {
-      const members = await fetchAll(`${BASE}/api/v2/groups/${groupId}/roles`, accessToken, budget);
-      for (const m of members) {
-        if (m.role !== "learner") continue;
-        if (!learners.has(m.userId)) learners.set(m.userId, new Set());
-        learners.get(m.userId).add(groupName);
-      }
+    if (mode === "learners") {
+      const learners = await getLearners(accessToken);
+      return Response.json({ total: learners.length, learners, fetchedAt: new Date().toISOString() });
     }
-
-    // 2. Path stats for the in-scope paths (brackets must not be encoded)
-    const query = PATH_IDS.map((id, i) => `pathId[in][${i}]=${id}`).join("&");
-    const stats = await fetchAll(`${BASE}/api/v2/paths/stats?${query}`, accessToken, budget);
-
-    // 3. Per learner: any activity in any enrollment (including unenrolled ones,
-    //    so lost progress is never hidden)
-    const byUser = new Map();
-    const statusCounts = {};
-    for (const s of stats) {
-      statusCounts[s.status?.type ?? "none"] = (statusCounts[s.status?.type ?? "none"] || 0) + 1;
-      if (!learners.has(s.userId)) continue;
-      let u = byUser.get(s.userId);
-      if (!u) {
-        u = { active: false, enrollments: 0, pathIds: new Set(), enrolledAt: null };
-        byUser.set(s.userId, u);
-      }
-      if ((s.progress ?? 0) > 0 || (s.timeSpent ?? 0) > 0 || s.startedAt) u.active = true;
-      if (!s.unenrolledAt) u.enrollments++;
-      u.pathIds.add(s.pathId);
-      if (s.enrolledAt && (!u.enrolledAt || s.enrolledAt < u.enrolledAt)) u.enrolledAt = s.enrolledAt;
-    }
-
-    // 4. Names and emails from the Apps Script user cache
-    const usersById = new Map();
-    try {
-      const cacheRes = await fetch(CACHE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "getLearnerCache" }),
-        redirect: "follow",
-      });
-      const cacheBody = cacheRes.ok ? await cacheRes.json() : {};
-      if (cacheBody.success && cacheBody.cache) {
-        for (const [id, info] of Object.entries(cacheBody.cache)) usersById.set(id, info);
-      } else {
-        console.warn("Apps Script cache returned no data:", cacheBody.error || cacheRes.status);
-      }
-    } catch (error) {
-      console.error("Apps Script cache fetch threw:", error.message);
-    }
-
-    const describe = (userId, extra = {}) => {
-      const user = usersById.get(userId);
-      const name = user && user.firstName && user.lastName ? `${user.firstName} ${user.lastName}` : "Unknown";
-      return {
-        userId,
-        name,
-        email: user ? user.email || user.mail || "" : "",
-        groups: [...learners.get(userId)].sort(),
-        ...extra,
-      };
-    };
-
-    const enrolledNoProgress = [];
-    const notEnrolled = [];
-    let withProgress = 0;
-    for (const userId of learners.keys()) {
-      const u = byUser.get(userId);
-      if (!u) notEnrolled.push(describe(userId));
-      else if (u.active) withProgress++;
-      else {
-        enrolledNoProgress.push(
-          describe(userId, {
-            enrolments: u.enrollments,
-            enrolledAt: u.enrolledAt,
-            pathIds: [...u.pathIds],
-          })
-        );
-      }
-    }
-    const byName = (a, b) => a.name.localeCompare(b.name);
-    enrolledNoProgress.sort(byName);
-    notEnrolled.sort(byName);
-
-    return Response.json({
-      summary: {
-        learnersInGroups: learners.size,
-        withProgress,
-        enrolledNoProgress: enrolledNoProgress.length,
-        notEnrolledInScopedPaths: notEnrolled.length,
-        statsRecords: stats.length,
-        pagesFetched: budget.pages,
-        statusCounts,
-        unknownNames: [...enrolledNoProgress, ...notEnrolled].filter((l) => l.name === "Unknown").length,
-      },
-      enrolledNoProgress,
-      notEnrolled,
-      fetchedAt: new Date().toISOString(),
-    });
+    return Response.json(await getStats(accessToken, params.get("cursor")));
   } catch (error) {
     console.error("Unexpected error in no-progress function:", error);
     return Response.json({ error: "An unexpected error occurred", detail: error.message }, { status: 500 });
