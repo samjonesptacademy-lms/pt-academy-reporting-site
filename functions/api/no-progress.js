@@ -10,6 +10,9 @@
  *        (the cursor for the following call, null when finished). The full
  *        result is too big for one invocation (Cloudflare's 50-subrequest cap),
  *        so the caller loops and merges.
+ * GET /api/no-progress?key=XXX&mode=programmes&ids=ID,ID[&cursor=URL]
+ *     -> raw per-enrolment status for the given programme-level paths (a subset
+ *        of PATH_IDS), for finished vs in-progress reporting
  *
  * Returns learner names and emails, so it is gated by a key (only its SHA-256
  * hash lives in this file).
@@ -276,14 +279,44 @@ async function getStats(accessToken, cursor) {
   };
 }
 
+async function getProgrammeStats(accessToken, ids, cursor) {
+  for (const id of ids) if (!PATH_IDS.includes(id)) throw new Error(`Path ${id} is not in scope`);
+  const first = `${BASE}/api/v2/paths/stats?${ids.map((id, i) => `pathId[in][${i}]=${id}`).join("&")}`;
+  let next = cursor || first;
+  if (!next.startsWith(`${BASE}/api/v2/paths/stats`)) throw new Error("Invalid cursor");
+
+  const records = [];
+  let pages = 0;
+  while (next && pages < MAX_PAGES) {
+    const page = await fetchPage(next, accessToken);
+    pages++;
+    for (const s of page.items) {
+      records.push({
+        u: s.userId,
+        p: s.pathId,
+        sessionId: s.sessionId,
+        status: s.status?.type ?? "none",
+        progress: s.progress ?? 0,
+        timeSpent: s.timeSpent ?? 0,
+        startedAt: s.startedAt ?? null,
+        completedAt: s.completedAt ?? null,
+        enrolledAt: s.enrolledAt ?? null,
+        unenrolledAt: s.unenrolledAt ?? null,
+      });
+    }
+    next = page.next;
+  }
+  return { pages, next, records };
+}
+
 export async function onRequestGet({ request, env }) {
   const params = new URL(request.url).searchParams;
   if ((await sha256Hex(params.get("key") || "")) !== KEY_SHA256) {
     return Response.json({ error: "Forbidden" }, { status: 403 });
   }
   const mode = params.get("mode");
-  if (mode !== "learners" && mode !== "stats") {
-    return Response.json({ error: "mode must be learners or stats" }, { status: 400 });
+  if (mode !== "learners" && mode !== "stats" && mode !== "programmes") {
+    return Response.json({ error: "mode must be learners, stats or programmes" }, { status: 400 });
   }
 
   try {
@@ -305,6 +338,11 @@ export async function onRequestGet({ request, env }) {
     if (mode === "learners") {
       const learners = await getLearners(accessToken);
       return Response.json({ total: learners.length, learners, fetchedAt: new Date().toISOString() });
+    }
+    if (mode === "programmes") {
+      const ids = (params.get("ids") || "").split(",").filter(Boolean);
+      if (ids.length === 0) return Response.json({ error: "ids is required" }, { status: 400 });
+      return Response.json(await getProgrammeStats(accessToken, ids, params.get("cursor")));
     }
     return Response.json(await getStats(accessToken, params.get("cursor")));
   } catch (error) {
