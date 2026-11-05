@@ -13,6 +13,10 @@
  * GET /api/no-progress?key=XXX&mode=programmes&ids=ID,ID[&cursor=URL]
  *     -> raw per-enrolment status for the given programme-level paths (a subset
  *        of PATH_IDS), for finished vs in-progress reporting
+ * GET /api/no-progress?key=XXX&mode=manager&userId=ID[&from=N]
+ *     -> groups where userId holds the manager role, with their learners.
+ *        Scans the group list in chunks (resumable via `from` / `nextFrom`).
+ *        `programmes` also accepts &users=ID,ID to return only those learners.
  *
  * Returns learner names and emails, so it is gated by a key (only its SHA-256
  * hash lives in this file).
@@ -279,7 +283,41 @@ async function getStats(accessToken, cursor) {
   };
 }
 
-async function getProgrammeStats(accessToken, ids, cursor) {
+async function getManagerGroups(accessToken, managerId, from) {
+  const SUBREQUEST_BUDGET = 40;
+  let calls = 0;
+  const groups = [];
+  let next = `${BASE}/api/v2/groups`;
+  while (next && calls < 10) {
+    const page = await fetchPage(next, accessToken);
+    calls++;
+    groups.push(...page.items);
+    next = page.next;
+  }
+  if (next) throw new Error("Group list too long to scan");
+
+  const found = [];
+  let i = from;
+  for (; i < groups.length && calls < SUBREQUEST_BUDGET; i++) {
+    const g = groups[i];
+    const members = [];
+    let isManager = false;
+    let url = `${BASE}/api/v2/groups/${g._id}/roles`;
+    while (url && calls < SUBREQUEST_BUDGET + 5) {
+      const page = await fetchPage(url, accessToken);
+      calls++;
+      for (const m of page.items) {
+        if (m.userId === managerId && m.role === "manager") isManager = true;
+        if (m.role === "learner") members.push(m.userId);
+      }
+      url = page.next;
+    }
+    if (isManager) found.push({ groupId: g._id, name: g.name, learners: members });
+  }
+  return { totalGroups: groups.length, nextFrom: i < groups.length ? i : null, found };
+}
+
+async function getProgrammeStats(accessToken, ids, cursor, users) {
   for (const id of ids) if (!PATH_IDS.includes(id)) throw new Error(`Path ${id} is not in scope`);
   const first = `${BASE}/api/v2/paths/stats?${ids.map((id, i) => `pathId[in][${i}]=${id}`).join("&")}`;
   let next = cursor || first;
@@ -291,6 +329,7 @@ async function getProgrammeStats(accessToken, ids, cursor) {
     const page = await fetchPage(next, accessToken);
     pages++;
     for (const s of page.items) {
+      if (users && !users.has(s.userId)) continue;
       records.push({
         u: s.userId,
         p: s.pathId,
@@ -315,8 +354,8 @@ export async function onRequestGet({ request, env }) {
     return Response.json({ error: "Forbidden" }, { status: 403 });
   }
   const mode = params.get("mode");
-  if (mode !== "learners" && mode !== "stats" && mode !== "programmes") {
-    return Response.json({ error: "mode must be learners, stats or programmes" }, { status: 400 });
+  if (mode !== "learners" && mode !== "stats" && mode !== "programmes" && mode !== "manager") {
+    return Response.json({ error: "mode must be learners, stats, programmes or manager" }, { status: 400 });
   }
 
   try {
@@ -339,10 +378,15 @@ export async function onRequestGet({ request, env }) {
       const learners = await getLearners(accessToken);
       return Response.json({ total: learners.length, learners, fetchedAt: new Date().toISOString() });
     }
+    if (mode === "manager") {
+      const userId = params.get("userId");
+      if (!userId) return Response.json({ error: "userId is required" }, { status: 400 });
+      return Response.json(await getManagerGroups(accessToken, userId, Number(params.get("from")) || 0));
+    }
     if (mode === "programmes") {
       const ids = (params.get("ids") || "").split(",").filter(Boolean);
       if (ids.length === 0) return Response.json({ error: "ids is required" }, { status: 400 });
-      return Response.json(await getProgrammeStats(accessToken, ids, params.get("cursor")));
+      return Response.json(await getProgrammeStats(accessToken, ids, params.get("cursor"), params.get("users") ? new Set(params.get("users").split(",")) : null));
     }
     return Response.json(await getStats(accessToken, params.get("cursor")));
   } catch (error) {
